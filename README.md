@@ -44,7 +44,7 @@ A production-ready, reusable WhatsApp Business / WhatsApp Cloud API integration 
   - [Scenario reference](#scenario-reference)
   - [`WA_ERROR_CODE` catalogue](#wa_error_code-catalogue)
   - [Debugging checklist](#debugging-checklist)
-16. [Retry Policy](#retry-policy)
+16. [Retries & retryPolicy](#retries--retrypolicy)
 17. [Multi-Account & Multi-Number Support](#multi-account--multi-number-support)
 18. [Phone Number Normalization](#phone-number-normalization)
 19. [Template Utilities](#template-utilities)
@@ -65,7 +65,7 @@ This SDK provides a clean, typed HTTP client for the [WhatsApp Cloud API](https:
 - Sending Utility, Marketing, and Authentication (OTP) template messages
 - Webhook challenge verification and inbound message parsing
 - Structured Meta error normalization with known error codes
-- Automatic retries with exponential backoff and `Retry-After` header support
+- Automatic retries for JSON Graph calls ([Retries & retryPolicy](#retries--retrypolicy)): exponential backoff, jitter, `Retry-After` handling
 - Multi-WABA and multi-phone-number configurations
 
 The package is **framework-agnostic** and has **zero dependencies on any CRM system, database, queue, or HTTP framework**. Callers supply credentials; the SDK handles the wire protocol.
@@ -91,7 +91,7 @@ The package is **framework-agnostic** and has **zero dependencies on any CRM sys
 | **User moderation**     | Block and unblock users                                                                  |
 | **Error handling**      | Structured `WhatsAppGraphError` with `code`, `errorSubcode`, `fbtraceId`, `retryAfterMs` |
 | **Known error codes**   | `WA_ERROR_CODE` catalogue (131047, 132001, 130429, and more)                             |
-| **Retries**             | Exponential backoff + jitter, `Retry-After` header support, configurable predicate       |
+| **Retries**             | [Retries & retryPolicy](#retries--retrypolicy): JSON `request()` only; defaults + `retryPolicy: null` |
 | **Multi-account**       | Clone client with a different phone number or full credentials                           |
 | **TypeScript**          | Complete types for all inputs, outputs, and webhook shapes                               |
 | **No env coupling**     | The SDK never reads `Deno.env` — caller passes credentials explicitly                    |
@@ -210,6 +210,7 @@ const credentials: WhatsAppCredentials = {
 
 ```ts
 import type { WhatsAppClientOptions } from "@WhatsApp/sdk";
+import { defaultRetryPredicate } from "@WhatsApp/sdk";
 
 const options: WhatsAppClientOptions = {
   /**
@@ -249,17 +250,14 @@ const options: WhatsAppClientOptions = {
   /**
    * Retry policy for transient failures.
    * Pass null to disable retries entirely.
-   * @default 3 attempts, 300 ms base, 8 s cap, retries on network errors + 429 + 5xx
+   * @default See [Retries & retryPolicy](#retries--retrypolicy) (`DEFAULT_RETRY_POLICY` / `defaultRetryPredicate`).
    */
   retryPolicy: {
     maxAttempts: 3,
     baseMs: 300,
     maxMs: 8_000,
     jitterRatio: 0.25,
-    retryPredicate: (err) => {
-      const status = "httpStatus" in err ? err.httpStatus : 0;
-      return status === 0 || status === 429 || status >= 500;
-    },
+    retryPredicate: defaultRetryPredicate,
   },
 };
 ```
@@ -975,11 +973,10 @@ Meta documents WhatsApp Cloud API error semantics in the [WhatsApp Cloud API —
 
 ### End-to-end flow
 
-1. **`fetch`** returns an HTTP status and a response body (Graph failures almost always include JSON with a top-level `error` key).
-2. **`WhatsAppHttpClient.request`** (backing `get` / `post` / `put` / `delete`) parses JSON. When **`response.ok`** is false, it builds a **`WhatsAppGraphError`** via **`parseMetaError(httpStatus, body, retryAfterMs)`**, where **`retryAfterMs`** comes from the **`Retry-After`** header when Meta sends one ([`client.ts`](client.ts)).
-3. When **`retryPolicy`** is not `null`, the implementation wraps calls in **`withRetry`** ([`retry.ts`](retry.ts)): if **`retryPredicate`** (default **`defaultRetryPredicate`**) returns **true**, the error is treated as transient — the client sleeps (honouring **`retryAfterMs`** when present, otherwise exponential backoff + jitter) and retries up to **`maxAttempts`**. **`retryAfterMs`** is **capped by `retryPolicy.maxMs`** on each wait.
-4. If retries are exhausted or the predicate returns **false**, the caller receives **`{ ok: false, error }`** with the last **`WhatsAppGraphError`**.
-5. When **`fetch`** throws before any HTTP response (DNS, TLS, timeout, abort), the SDK uses **`wrapNetworkError`** → **`httpStatus: 0`**, **`message`** from the thrown **`Error`**.
+1. **`fetch`** returns an HTTP status and a response body (Graph failures almost always include JSON with a top-level `error` key). JSON parsing failures yield `{}` before [`parseMetaError`](errors/graph_error.ts).
+2. When **`response.ok`** is false, the client builds **`WhatsAppGraphError`** via **`parseMetaError(httpStatus, body, retryAfterMs)`**, where **`retryAfterMs`** is set only when Meta sends a parseable **`Retry-After`** header ([`parseRetryAfterHeader`](client.ts)).
+3. **Retries** apply only to **`WhatsAppHttpClient.request`** when **`retryPolicy`** is not **`null`** — see [Retries & retryPolicy](#retries--retrypolicy) for throw vs return, backoff, and **`maxAttempts`** semantics.
+4. When **`fetch`** throws before any HTTP response, [`wrapNetworkError`](errors/graph_error.ts) produces **`httpStatus: 0`**; depending on **`retryPolicy`**, that may be returned immediately or surfaced through the retry loop ([`client.ts`](client.ts)).
 
 ### Meta Graph error envelope
 
@@ -1033,31 +1030,25 @@ HTTP status is **not** inside the JSON body; you read it from the response statu
 - **`parseMetaError(httpStatus, body, retryAfterMs?)`** ([`errors/graph_error.ts`](errors/graph_error.ts)) — Parses JSON `body`, extracts `body.error`, and fills `WhatsAppGraphError`. If `body` is not a Graph error envelope, `message` falls back to `WhatsApp API error — HTTP {httpStatus}` and `code` / `fbtraceId` may be absent. Exported from `@WhatsApp/sdk` for tests or custom HTTP glue.
 - **`wrapNetworkError(err)`** — Converts a thrown network / `fetch` failure into `{ httpStatus: 0, message: err.message }`. **`httpStatus === 0` means no HTTP response was received** (DNS, TLS, timeout, aborted request, etc.).
 - **JSON requests** (`WhatsAppHttpClient.request`, used by `get` / `post` / `put` / `delete`): on non-OK HTTP status, the client calls `parseMetaError` and passes **`retryAfterMs`** when [`Retry-After`](https://www.rfc-editor.org/rfc/rfc9110#section-10.2.3) is present (integer seconds or HTTP-date — see [`parseRetryAfterHeader` in `client.ts`](client.ts)).
-- **Multipart media upload** (`requestForm` / `wa.media.upload`): uses `parseMetaError` on failure but **does not** attach retry policy or `Retry-After` parsing (single attempt).
-- **Media binary download** (`requestBinary` / `wa.media.download`): same — **no automatic retries**.
+- **Multipart media upload** (`requestForm` / `wa.media.upload`): **single attempt** — [`requestForm`](client.ts) does not invoke **`withRetry`** (comment in source: **`FormData` body is consumed on first read**). **`Retry-After`** is **not** read on this path; failures use **`parseMetaError(httpStatus, data)`** without **`retryAfterMs`**.
+- **Media binary download** (`requestBinary` / `wa.media.download`): **single attempt**, no **`withRetry`**, no **`Retry-After`** parsing on failure.
 - **Template `listAll` pagination** (`listAllTemplates`): follows `paging.next` with plain `fetch` — **no** SDK retry wrapper on individual pages.
 
 ### Rate limiting / `Retry-After`
 
 Graph applications may receive **HTTP `429`** or other throttling signals. Meta’s platform-wide guidance lives under [Graph API — Rate limiting](https://developers.facebook.com/docs/graph-api/overview/rate-limiting/). WhatsApp also enforces [**messaging limits** and quality](https://developers.facebook.com/docs/whatsapp/messaging-limits) per phone number tier — those surface as WhatsApp-specific `code` values (see Meta’s error-code guide), not only as HTTP 429.
 
-When Meta returns **`Retry-After`**, this SDK parses it into **`WhatsAppGraphError.retryAfterMs`**. The default retry scheduler uses that value when deciding wait time (capped by `retryPolicy.maxMs` — default **8000 ms**).
+When Meta returns **`Retry-After`**, this SDK parses it into **`WhatsAppGraphError.retryAfterMs`** on **`WhatsAppHttpClient.request`** only. Scheduling uses **`retry.ts`** **`computeDelay`** — capped by **`retryPolicy.maxMs`** per wait — see [Retries & retryPolicy](#retries--retrypolicy).
 
 **Constants:** `WA_ERROR_CODE.RATE_LIMIT` (**130429**) and `WA_ERROR_CODE.SPAM_RATE_LIMIT` (**131048**) are included in this package for convenience; Meta’s list is **non-exhaustive** — always consult the official error-code documentation for additions.
 
-### `defaultRetryPredicate` — when retries are reasonable
+### `defaultRetryPredicate` — summary
 
-[`defaultRetryPredicate`](errors/graph_error.ts) returns **true** (eligible for another attempt) when:
+[`defaultRetryPredicate`](errors/graph_error.ts) is the default **`WhatsAppRetryPolicy.retryPredicate`**. It retries **`httpStatus` `0`**, **`408`**, **`429`**, **`502`**, **`503`**, **`504`**, and **any `instanceof Error`** thrown before **`parseMetaError`**. It does **not** inspect Graph **`code`** (e.g. **`131047`**): non-retryable HTTP statuses **return `{ ok: false }` immediately** without entering **`withRetry`**.
 
-| Condition | Rationale |
-| --------- | --------- |
-| `err instanceof Error` | Treated as pre-`parseMetaError` transport failure inside `withRetry`. |
-| `httpStatus === 0` | No HTTP response (`wrapNetworkError`). |
-| `httpStatus` is `408`, `429`, `502`, `503`, or `504` | Timeouts, explicit throttling, or transient upstream errors. |
+Full algorithm (throw vs return, interaction with **`withRetry`**, customizing **`retryPredicate`**) → [Retries & retryPolicy](#retries--retrypolicy).
 
-**All other parsed Graph errors return false** — e.g. `131047` (customer care window), `132001` (template not approved), `131026` (recipient not on WhatsApp), invalid parameters, OAuth `190`, etc. **Retrying will not fix these** until your integration or Meta configuration changes.
-
-Override via `WhatsAppClientOptions.retryPolicy.retryPredicate` when you need stricter or looser rules (see [Retry Policy](#retry-policy)).
+Override via [`WhatsAppClientOptions.retryPolicy`](types/config.ts).
 
 ### Scenario reference
 
@@ -1195,30 +1186,125 @@ if (!result.ok) {
 3. **Correlate webhook `failed` statuses** (`status.errors[].code`) with outbound `/messages` failures — the same WhatsApp codes often appear in both paths.
 4. **Inspect `error.raw` sparingly** in secure environments; redact before forwarding to external vendors.
 5. **`httpStatus === 0`** → infrastructure / client-side issue first (DNS, TLS, firewall, timeout); **`httpStatus >= 400` with Graph JSON** → token, payload, or policy issue first.
-6. **`retryAfterMs` present** → throttle-aware backoff; remember **`maxMs` caps** server hints in the default retry helper ([`retry.ts`](retry.ts)).
+6. **`retryAfterMs`** → see [Retries & retryPolicy](#retries--retrypolicy) (**`maxMs`** cap per wait).
 7. For **codes not covered by `WA_ERROR_CODE`**, branch on numeric `code` from Meta’s documentation and add constants in your app if needed.
 
 ---
 
-## Retry Policy
+## Retries & retryPolicy
 
-Errors are normalized as described in [Error Handling](#error-handling). This section focuses on **when** the SDK repeats a failed JSON request.
+This section describes retry behaviour **exactly as implemented** in [`WhatsAppHttpClient`](client.ts), [`withRetry` / `DEFAULT_RETRY_POLICY`](retry.ts), [`WhatsAppRetryPolicy` / `WhatsAppClientOptions`](types/config.ts), and [`defaultRetryPredicate`](errors/graph_error.ts). **`withRetry` and `DEFAULT_RETRY_POLICY` are not exported** from `@WhatsApp/sdk`; configure retries only via **`WhatsAppClientOptions.retryPolicy`** on **`WhatsAppClient`**.
 
-Retries are implemented inside **`withRetry`** ([`retry.ts`](retry.ts)) using **`DEFAULT_RETRY_POLICY`** unless you override or disable **`retryPolicy`** on the client. **`withRetry` itself is not exported** from `@WhatsApp/sdk` — configure behaviour via **`WhatsAppClientOptions.retryPolicy`**.
+Errors are normalized into **`WhatsAppGraphError`** as described in [Error Handling](#error-handling).
 
-**Where retries apply:** `WhatsAppHttpClient.request()` (used by most `wa.*` calls). **No automatic retries** for `requestForm` (media upload), `requestBinary` (media download), or manual pagination inside `listAllTemplates`.
+### What gets retried
 
-The default policy retries on:
+**Retries apply only to [`WhatsAppHttpClient.request`](client.ts)** — the JSON path used by **`get`**, **`post`**, **`put`**, and **`delete`**. In practice that covers most Cloud API calls wired through the SDK: outbound **`/messages`**, template **`GET`/`POST`/`DELETE`** on the WABA, business profile, phone-number listing, block/unblock, etc.
 
-- Network / transport failures (no HTTP response received → `httpStatus === 0` after `wrapNetworkError`)
-- HTTP `408` (Request Timeout)
-- HTTP `429` (Rate Limit) — uses `Retry-After` via `WhatsAppGraphError.retryAfterMs` when present (capped by `maxMs`)
-- HTTP `502`, `503`, `504` (transient upstream errors)
+**No automatic retries** for:
 
-**Defaults:** 3 attempts, 300 ms base delay, 8 s cap, 25% jitter.
+| Path | Reason in code |
+| ---- | ---------------- |
+| [`requestForm`](client.ts) (e.g. **`wa.media.upload`**) | Comment: **no retry on form-data because the `FormData` body is consumed on first read**. Single **`fetch`**; failures call **`parseMetaError(status, data)`** without **`retryAfterMs`**. |
+| [`requestBinary`](client.ts) (e.g. **`wa.media.download`** against the CDN URL) | Separate **`fetch`**; **does not** call **`request`** or **`withRetry`**; failures use **`parseMetaError`** without reading **`Retry-After`**. |
+| [`listAllTemplates`](methods/templates.ts) pagination | Follows **`paging.next`** with a standalone **`fetch`** loop — **outside** **`WhatsAppHttpClient.request`**, so **no** SDK retry wrapper per page. |
+
+### Default behaviour (`DEFAULT_RETRY_POLICY`)
+
+[`DEFAULT_RETRY_POLICY`](retry.ts) is used when **`retryPolicy`** is **omitted** (and not **`null`**). It matches [`WhatsAppRetryPolicy`](types/config.ts):
+
+| Field | Default value |
+| ----- | ------------- |
+| **`maxAttempts`** | **`3`** — **total attempts including the first** (see JSDoc on [`WhatsAppRetryPolicy.maxAttempts`](types/config.ts)). |
+| **`baseMs`** | **`300`** |
+| **`maxMs`** | **`8000`** |
+| **`jitterRatio`** | **`0.25`** |
+| **`retryPredicate`** | **`defaultRetryPredicate`** ([`errors/graph_error.ts`](errors/graph_error.ts)) |
+
+### How the retry loop works
+
+**1. `retryPolicy === null`** ([`client.ts`](client.ts))
+
+- **`withRetry` is not used.** The inner **`execute(1)`** runs once.
+- If **`fetch`** throws: **`execute`** returns **`{ ok: false, error: wrapNetworkError(err) }`** immediately (special case `attempt === 1 && !policy`).
+- If **`!response.ok`**: **`parseMetaError`** builds **`WhatsAppGraphError`** (with **`retryAfterMs`** when **`Retry-After`** is present). Because **`policy`** is falsy, **`policy && retryPredicate(error)`** is false → **`execute`** **returns** **`{ ok: false, error }`** — **never throws** for HTTP errors on this path.
+
+**2. `retryPolicy` is an object (including defaults)**
+
+- **`execute`** is passed to **`withRetry(execute, policy)`** ([`retry.ts`](retry.ts)).
+- **`execute`** receives **`attempt`** (1-based) for logging hooks only; retry eligibility does **not** use **`attempt`** inside **`execute`** — it uses **`policy.retryPredicate`**.
+
+**Inside `execute` when `policy` is non-null:**
+
+| Outcome | Behaviour |
+| ------- | --------- |
+| **`fetch`** throws | **Throws** the raw caught value (so **`withRetry`** can catch it). Exception: if **`retryPolicy` were null** and **`attempt === 1`**, **`execute`** would return **`wrapNetworkError`** instead (see above). |
+| **`response.ok`** | **Returns** **`{ ok: true, data }`**. |
+| **`!response.ok`** | Builds **`WhatsAppGraphError`** via **`parseMetaError`**. If **`policy.retryPredicate(error)`** is **true**, **`execute` throws that error**. If **false**, **`execute` returns** **`{ ok: false, error }`** — **no retry** for that HTTP response. |
+
+**Inside `withRetry`:**
+
+- Loop **`attempt`** from **`1`** to **`policy.maxAttempts`** inclusive ([`retry.ts`](retry.ts)).
+- **`await fn(attempt)`** — i.e. **`execute(attempt)`**.
+- On **success**, **`withRetry`** returns that **`WhatsAppResult`** to **`request`**.
+- On **catch**: **`shouldRetry = (attempt < maxAttempts) && retryPredicate(err)`**. If **false**, **break** and **`throw lastError`**. If **true**, **`computeDelay`** then **`sleep`**, then next iteration.
+
+**After `withRetry` throws** ([`client.ts`](client.ts)):
+
+- If **`lastError`** is an object with **`httpStatus`** → **`return { ok: false, error: lastError as WhatsAppGraphError }`** (covers exhausted retries on **`WhatsAppGraphError`**).
+- Else → **`return { ok: false, error: wrapNetworkError(err) }`** (covers raw **`Error`** after retries).
+
+So **`maxAttempts`** is the **total number of tries**, not “extra retries after the first”. Example: **`maxAttempts: 3`** → at most three **`fetch`** executions for that **`request`** call when failures keep satisfying **`retryPredicate`**.
+
+### Backoff (`computeDelay`)
+
+[`computeDelay`](retry.ts) runs **after** a caught failure when **`withRetry`** decides another attempt is allowed:
+
+1. If the caught value has **`retryAfterMs`** (Meta **`Retry-After`** parsed on HTTP errors in **`request`** only), the wait is **`Math.min(retryAfterMs, policy.maxMs)`**. **No exponential step and no jitter** on this branch.
+2. Otherwise the base delay is **`min(baseMs * 2^(attempt - 1), maxMs)`**, plus jitter **`exponential * jitterRatio * Math.random()`**, rounded (**`Math.round(exponential + jitter)`**).
+
+Here **`attempt`** is **`withRetry`’s loop counter** (first failure uses **`attempt === 1`** → exponent **`0`** → multiplier **`1`**).
+
+### `defaultRetryPredicate` ([`errors/graph_error.ts`](errors/graph_error.ts))
+
+[`defaultRetryPredicate`](errors/graph_error.ts) receives **`Error`** **or** **`{ httpStatus?, code? }`** ( **`WhatsAppGraphError`** satisfies the latter):
+
+| Input | Returns **`true`** |
+| ----- | ------------------ |
+| **`err instanceof Error`** | Always (**comment: network / fetch-level failure**). |
+| Object with **`httpStatus === 0`** | **`true`** (treat missing **`httpStatus`** as **`0`** via **`?? 0`**). |
+| Object with **`httpStatus`** in **`408`, `429`, `502`, `503`, `504`** | **`true`** |
+
+**Everything else** → **`false`** (including **`401`**, **`400`**, **`403`**, **`404`**, **`5xx`** other than 502/503/504, **`2xx`** never reach predicate).
+
+**Important:** For **`WhatsAppGraphError`**, **`defaultRetryPredicate` does not read `code`** — only **`httpStatus`**. Graph **`code`** values such as rate-limit or spam signals do **not** change the default predicate unless you supply a custom **`retryPredicate`**.
+
+**`Error` vs structured error inside `withRetry`:** Only failures that **`execute` throws** reach **`withRetry`**. **`fetch`** throws produce raw **`Error`** (predicate **`true`** if transient budget remains). **`WhatsAppGraphError`** with predicate **`true`** is **thrown by `execute`** for another attempt; predicate **`false`** yields immediate **`{ ok: false }`** without **`withRetry`** seeing it.
+
+### Disabling retries
+
+**`retryPolicy: null`** ([`WhatsAppClientOptions`](types/config.ts))
+
+- **`withRetry` is skipped.** Exactly **one** **`execute`** run per **`request`** call; HTTP errors **return** **`{ ok: false }`**; **`fetch`** errors **return** **`wrapNetworkError`** without entering **`withRetry`**.
+
+**`maxAttempts: 1`**
+
+- **`withRetry`** still runs, but **`attempt < maxAttempts`** is **`false`** on the first failure → **no second attempt**. Semantically **one try**, but the code path goes through **`withRetry`** (unlike **`retryPolicy: null`**). For transport errors **`execute`** still **throws** into **`withRetry`** once; the outer **`catch`** normalizes to **`{ ok: false }`**.
+
+Use **`retryPolicy: null`** when you want the **`retryPolicy === null`** branch in **`execute`** (e.g. OTP / strict no-duplicate sends).
 
 ```ts
-// Customize retry behavior
+const wa = new WhatsAppClient(credentials, { retryPolicy: null });
+```
+
+### Customizing (`WhatsAppRetryPolicy`)
+
+Pass a full **`WhatsAppRetryPolicy`** object — all fields are required on the type ([`types/config.ts`](types/config.ts)).
+
+```ts
+import { WhatsAppClient } from "@WhatsApp/sdk";
+import { defaultRetryPredicate } from "@WhatsApp/sdk";
+
 const wa = new WhatsAppClient(credentials, {
   retryPolicy: {
     maxAttempts: 5,
@@ -1226,17 +1312,29 @@ const wa = new WhatsAppClient(credentials, {
     maxMs:       15_000,
     jitterRatio: 0.3,
     retryPredicate: (err) => {
-      if (err instanceof Error) return true;          // network error — always retry
+      if (err instanceof Error) return true;
       const { httpStatus, code } = err as { httpStatus?: number; code?: number };
-      if (code === 131047) return false;              // policy error — never retry
-      return httpStatus === 0 || httpStatus === 429 || (httpStatus ?? 0) >= 500;
+      // Still skip obvious client / policy failures even if Meta returned an unusual HTTP status
+      if (code === 131047 || code === 132001) return false;
+      if (httpStatus === 401 || httpStatus === 403 || httpStatus === 404) return false;
+      return defaultRetryPredicate(err);
     },
   },
 });
-
-// Disable retries entirely (e.g. for OTPs where duplicates are unacceptable)
-const wa = new WhatsAppClient(credentials, { retryPolicy: null });
 ```
+
+Start from **`defaultRetryPredicate`** and narrow cases you never want retried; avoid blindly retrying **`4xx`** template or auth errors.
+
+### Operational notes
+
+**HTTP `429` and `Retry-After`**
+
+- On **`request`** failures only, **`Retry-After`** is parsed ([`parseRetryAfterHeader`](client.ts)) into **`WhatsAppGraphError.retryAfterMs`**.
+- **`defaultRetryPredicate`** retries **`429`**; delay uses **`retryAfterMs`** when set, **capped by `maxMs`** per wait ([`computeDelay`](retry.ts)).
+
+**Idempotency / duplicate sends**
+
+- Retries repeat the **same** **`fetch`** (same JSON body for **`POST`** to **`/messages`**). Meta does **not** expose an idempotency key in this SDK — **duplicate deliveries are possible** if the first request succeeds after a timeout but the client treats it as failure, or if your app retries at a higher layer too. Use **dedupe keys**, **outbox patterns**, or **`retryPolicy: null`** where duplicates are unacceptable (see [Production Notes](#production-notes)).
 
 ---
 
@@ -1359,6 +1457,8 @@ WhatsAppRetryPolicy          // maxAttempts, baseMs, maxMs, jitterRatio, retryPr
 WhatsAppRequestHook          // (info: { method, path, bodySize? }) => void
 ```
 
+[`WhatsAppRetryPolicy`](types/config.ts) default numbers, **`retryPolicy: null`**, and backoff → [Retries & retryPolicy](#retries--retrypolicy).
+
 ### Result and errors
 
 ```ts
@@ -1473,7 +1573,7 @@ BlockUsersParams             // userPhones: string[]
 
 **Retries**
 
-- JSON requests use **`withRetry`** internally (see [Retry Policy](#retry-policy)); media upload/download and `listAllTemplates` pagination do **not**.
+- JSON requests use **`withRetry`** when **`retryPolicy !== null`** ([Retries & retryPolicy](#retries--retrypolicy)); **`requestForm`** / **`requestBinary`** / **`listAllTemplates`** pagination do **not**.
 - The default policy retries network errors (`httpStatus === 0`), HTTP **408**, **429**, and **502–504** up to **3** attempts.
 - When Meta sends **`Retry-After`**, the wait honours **`WhatsAppGraphError.retryAfterMs`** but **never exceeds `retryPolicy.maxMs`** per attempt (default **8000 ms**).
 - Never configure retries for **`131047`** (policy / customer care window) or **`132001`** (template not approved) — **`defaultRetryPredicate`** already skips non-transient HTTP statuses; extend custom predicates if you map Graph **`code`** explicitly.
